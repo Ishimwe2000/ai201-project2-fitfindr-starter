@@ -1,160 +1,58 @@
 # FitFindr
 
-A multi-tool AI agent that helps users find secondhand fashion pieces and figure out how to wear them. Given a natural language query, FitFindr searches mock thrift listings, suggests outfit combinations against the user's wardrobe, and generates a shareable fit card caption — all in one flow.
-
----
+A multi-tool AI agent that helps users find secondhand fashion pieces and figure out how to wear them. Describe what you're looking for, and FitFindr searches thrift listings, suggests outfit combinations from your wardrobe, and writes a shareable caption.
 
 ## Setup
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # Mac/Linux
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the repo root:
+Add your Groq API key to a `.env` file in the repo root:
 ```
 GROQ_API_KEY=your_key_here
 ```
 
-Run the UI:
 ```bash
-python app.py
+python app.py     # launch the UI
+python agent.py   # CLI test
+pytest tests/     # run tests
 ```
 
-Run the CLI test:
-```bash
-python agent.py
-```
+## Tools
 
-Run tests:
-```bash
-pytest tests/
-```
+`search_listings(description, size, max_price)` — searches the mock listings dataset and returns matching items ranked by keyword relevance. `size` and `max_price` are optional filters. Returns an empty list if nothing matches, never raises.
 
----
+`suggest_outfit(new_item, wardrobe)` — takes the selected listing and the user's wardrobe and asks the LLM to suggest 1–2 complete outfit combinations using specific wardrobe pieces. If the wardrobe is empty, returns general styling advice instead.
 
-## Tool Inventory
+`create_fit_card(outfit, new_item)` — generates a 2–4 sentence casual caption (think OOTD post) for the outfit. Runs at a higher temperature so the output varies each time. If `outfit` is empty, returns an error string without calling the LLM.
 
-### `search_listings(description, size, max_price)`
+## Planning Loop
 
-**Purpose:** Searches the mock secondhand listings dataset and returns items ranked by keyword relevance.
-
-**Inputs:**
-- `description` (str) — natural language keywords (e.g., `"vintage graphic tee"`)
-- `size` (str | None) — size label to filter by; case-insensitive substring match so `"M"` matches `"S/M"`. Pass `None` to skip.
-- `max_price` (float | None) — maximum price inclusive in USD. Pass `None` to skip.
-
-**Output:** `list[dict]` — list of matching listing dicts sorted by relevance score (highest first). Each dict contains: `id`, `title`, `description`, `category`, `style_tags` (list), `size`, `condition`, `price` (float), `colors` (list), `brand` (str | None), `platform`. Returns `[]` if nothing matches — never raises.
-
----
-
-### `suggest_outfit(new_item, wardrobe)`
-
-**Purpose:** Given the thrifted item and the user's wardrobe, calls the LLM to suggest 1–2 complete outfit combinations. Falls back to general styling advice if the wardrobe is empty.
-
-**Inputs:**
-- `new_item` (dict) — a listing dict from `search_listings`
-- `wardrobe` (dict) — wardrobe dict with an `"items"` key (list of wardrobe item dicts). Each item has `id`, `name`, `category`, `colors` (list), `style_tags` (list), `notes` (str | None). May be empty.
-
-**Output:** `str` — outfit suggestion text. If wardrobe is empty, contains general styling advice. If the LLM call fails, returns `"Could not generate outfit suggestion: [error]"` — never raises.
-
----
-
-### `create_fit_card(outfit, new_item)`
-
-**Purpose:** Generates a short, casual, shareable Instagram-style caption for the thrifted outfit. Uses a higher LLM temperature (1.2) so each run produces different output.
-
-**Inputs:**
-- `outfit` (str) — the outfit suggestion string from `suggest_outfit`
-- `new_item` (dict) — the listing dict for the thrifted item
-
-**Output:** `str` — a 2–4 sentence casual caption mentioning the item name, price, and platform naturally. If `outfit` is empty/whitespace, returns `"Could not create fit card — outfit description is empty."` without calling the LLM.
-
----
-
-## How the Planning Loop Works
-
-`run_agent()` in `agent.py` runs a sequential conditional loop — it does **not** call all tools unconditionally. Here is the exact conditional logic:
-
-1. **Parse**: extract `description`, `size`, and `max_price` from the query using regex.
-2. **Search**: call `search_listings(description, size, max_price)`.
-3. **Branch on results**:
-   - If results list is **empty** → set `session["error"]` with a specific message, **return immediately**. `suggest_outfit` and `create_fit_card` are never called.
-   - If results list is **non-empty** → set `session["selected_item"] = results[0]`, continue.
-4. **Outfit**: call `suggest_outfit(selected_item, wardrobe)`.
-5. **Fit card**: call `create_fit_card(outfit_suggestion, selected_item)`.
-6. Return the completed session.
-
-The agent's behavior genuinely differs based on what `search_listings` returns — the downstream tools only run when there is a valid item to work with.
-
----
+The agent parses the query with regex to extract a description, size, and price ceiling, then calls `search_listings`. If results come back empty, it sets an error message and returns immediately — `suggest_outfit` and `create_fit_card` never run. If there are results, it picks the top match and passes it through `suggest_outfit` and then `create_fit_card` in sequence.
 
 ## State Management
 
-All state lives in a single `session` dict initialized at the start of each `run_agent()` call. It flows forward through tool calls — no re-entry, no hardcoded values.
-
-| Key | Set when | Flows into |
-|-----|----------|------------|
-| `query` | Start | Parsing step |
-| `parsed` | After regex parsing | `search_listings` params |
-| `search_results` | After `search_listings` | Branch check + `selected_item` |
-| `selected_item` | After branch passes (`results[0]`) | `suggest_outfit`, `create_fit_card` |
-| `wardrobe` | Start (from user choice) | `suggest_outfit` |
-| `outfit_suggestion` | After `suggest_outfit` | `create_fit_card` |
-| `fit_card` | After `create_fit_card` | UI panel |
-| `error` | If `search_listings` returns `[]` | Early exit + UI error panel |
-
-The Gradio handler reads `session["error"]` first — if set, it shows the error in the listing panel and leaves the other panels empty.
-
----
+Everything lives in a single `session` dict that gets passed forward through the loop. The item returned by `search_listings` becomes `selected_item`, which flows into `suggest_outfit`. The string returned by `suggest_outfit` flows into `create_fit_card`. Nothing is re-entered by the user between steps.
 
 ## Error Handling
 
-**`search_listings` — no results:**
-Returns `[]`. The agent sets `session["error"]` = `"No listings found for '{description}' [in size X] [under $Y]. Try broader terms or remove the size/price filters."` and returns immediately. The UI shows this message in the listing panel; the outfit and fit card panels are empty.
+search_listings returning no results: the agent returns a specific message naming what was searched and suggesting the user broaden their query. The outfit and fit card panels stay empty.
 
-*Example from testing:*
-```
-query: "designer ballgown size XXS under $5"
-→ search_listings returns []
-→ session["error"] = "No listings found for 'designer ballgown' in size XXS under $5. Try broader terms or remove the size/price filters."
-→ fit_card = None (never called)
-```
+suggest_outfit with an empty wardrobe: detects the empty items list and switches to a general styling prompt. Returns useful advice rather than crashing or returning nothing.
 
-**`suggest_outfit` — empty wardrobe:**
-Does not crash. Detects `wardrobe["items"] == []` and switches to a general styling prompt ("what kinds of pieces pair well with this item?"). Returns a useful string regardless. The agent continues to `create_fit_card` normally.
-
-*Example from testing:*
-```python
-suggest_outfit(results[0], get_empty_wardrobe())
-# → "This faded band tee has strong streetwear energy. Pair it with..."
-# Never raises, never returns empty string
-```
-
-**`create_fit_card` — empty outfit string:**
-Guards immediately: `if not outfit or not outfit.strip(): return "Could not create fit card — outfit description is empty."` No LLM call is made. The returned string shows up in the fit card panel rather than crashing.
-
-*Example from testing:*
-```
-create_fit_card("", results[0])
-→ "Could not create fit card — outfit description is empty."
-```
-
----
+create_fit_card with an empty outfit string: returns "Could not create fit card — outfit description is empty." immediately without making an LLM call.
 
 ## Spec Reflection
 
-**One way the spec helped:** Designing the error handling table before any code forced me to decide *what the agent actually says* when things fail — not just "handle the error". This made the no-results message specific and actionable ("try broader terms or remove filters") instead of a generic "no results found", which is exactly the difference between useful and useless agent behavior.
+Writing the error handling table before any code forced a useful decision: what does the agent actually say when something fails? That specificity — "try broader terms or remove the size/price filters" — is what makes the no-results message useful rather than a dead end.
 
-**One way implementation diverged from the spec:** The original spec listed `outfit` as the only parameter for `create_fit_card`, but the stub signature in `tools.py` takes both `outfit` and `new_item`. This is the right design (the caption needs item details like price and platform), but the spec's parameter list was incomplete. I updated the planning.md tool spec to match the actual stub before implementing.
-
----
+One thing that diverged: the initial spec listed `outfit` as the only parameter for `create_fit_card`, but the stub takes both `outfit` and `new_item`. The caption needs the item's price and platform, so the stub was right. I updated planning.md to match before implementing.
 
 ## AI Usage
 
-**Instance 1 — `search_listings` keyword scoring**
-I gave Claude the Tool 1 spec block from `planning.md` (inputs with types, scoring logic described as "+2 for title/tag hits, +1 for description/color/brand"), the `load_listings()` signature, and asked it to implement the function. It generated a working implementation but used `set` intersection for scoring, which missed partial keyword matches (e.g., "tee" wouldn't match "graphic tee" tag). I overrode this with a substring-based check (`kw in tag`) so partial matches score correctly.
+For `search_listings`, I gave Claude the tool spec from planning.md and asked it to implement the scoring logic. It used set intersection, which missed partial matches ("tee" wouldn't score against the tag "graphic tee"). I switched it to substring matching so partial keyword hits count.
 
-**Instance 2 — `run_agent()` planning loop**
-I gave Claude the full architecture diagram from `planning.md` and the Planning Loop + State Management sections, and asked it to implement `run_agent()`. It correctly implemented the conditional branch and session dict. However, it initially used a simple `query.split()` for parsing rather than regex — which would have missed "under $30" reliably. I replaced the parsing logic with regex-based extraction (`re.search` for price and size patterns) and verified it against several example queries before keeping it.
+For `run_agent`, I gave Claude the architecture diagram and planning loop section. The structure came out right, but it used `query.split()` for parsing instead of regex, which wouldn't reliably catch "under $30". I replaced it with `re.search` patterns for price and size extraction.
